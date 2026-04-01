@@ -1,163 +1,164 @@
-import socket
-import threading
-import json
-import time
-import os
+import socket      # networking module for server-client communication
+import threading   # for handling multiple clients simultaneously
+import json        # for storing/loading seat data
+import time        # for timestamps (lock timeout)
+import os          # for file existence checking
 
-HOST = "127.0.0.1"
-PORT = 5001
+HOST = "127.0.0.1"   # server IP (localhost)
+PORT = 5001          # port server listens on
 
-SEAT_FILE = "seats.json"
-LOG_FILE = "wal.log"
+SEAT_FILE = "seats.json"   # file to store seat data persistently
+LOG_FILE = "wal.log"       # write-ahead log file
 
-LOCK_TIMEOUT = 15
+LOCK_TIMEOUT = 15   # lock expires after 15 seconds
 
-# Load seat data
-if os.path.exists(SEAT_FILE):
-    with open(SEAT_FILE) as f:
-        seats = json.load(f)
+# Load seat data if file exists, else initialize seats
+if os.path.exists(SEAT_FILE):  # check if seat file exists
+    with open(SEAT_FILE) as f:  # open file
+        seats = json.load(f)    # load JSON data into dictionary
 else:
-    seats = {str(i): {"status": "free", "holder": None} for i in range(1, 21)}
+    seats = {str(i): {"status": "free", "holder": None} for i in range(1, 21)}  # create 20 seats
 
-# Per-seat locks
+# Create a lock for each seat (to prevent race conditions)
 seat_locks = {seat: threading.Lock() for seat in seats}
 
-lock_table = {}
-waitlist = {}
+lock_table = {}   # stores temporary locks → {seat: (client, timestamp)}
+waitlist = {}     # stores waitlisted clients → {seat: [clients]}
 
 
 def save_state():
-    with open(SEAT_FILE, "w") as f:
-        json.dump(seats, f)
+    with open(SEAT_FILE, "w") as f:  # open file in write mode
+        json.dump(seats, f)          # save seat data
 
 
 def log_event(event):
-    with open(LOG_FILE, "a") as f:
-        f.write(event + "\n")
+    with open(LOG_FILE, "a") as f:   # open log file in append mode
+        f.write(event + "\n")        # write event line
 
 
-# Release expired locks
+# Background thread to release expired locks
 def release_expired_locks():
 
-    while True:
+    while True:  # run forever
 
-        time.sleep(2)
+        time.sleep(2)  # check every 2 seconds
 
-        now = time.time()
+        now = time.time()  # current timestamp
 
-        expired = []
+        expired = []  # list of expired seats
 
-        for seat in list(lock_table.keys()):
-            holder, ts = lock_table[seat]
+        for seat in list(lock_table.keys()):  # iterate over locked seats
+            holder, ts = lock_table[seat]     # get client + timestamp
 
-            if now - ts > LOCK_TIMEOUT:
+            if now - ts > LOCK_TIMEOUT:  # check if lock expired
                 expired.append(seat)
 
         for seat in expired:
 
-            print(f"Lock expired for seat {seat}")
+            print(f"Lock expired for seat {seat}")  # debug print
 
-            del lock_table[seat]
+            del lock_table[seat]  # remove lock
 
 
 def handle_lock(seat, client):
 
-    if seat not in seats:
+    if seat not in seats:  # check valid seat
         return "INVALID SEAT"
 
-    with seat_locks[seat]:
+    with seat_locks[seat]:  # acquire lock for that seat
 
-        if seats[seat]["status"] == "booked":
-            if seats[seat]["holder"] == client:
+        if seats[seat]["status"] == "booked":  # if already booked
+            if seats[seat]["holder"] == client:  # if same client
                 return "SEAT ALREADY YOURS"
-            if client not in waitlist.get(seat, []):
+            if client not in waitlist.get(seat, []):  # add to waitlist if not already
                 waitlist.setdefault(seat, []).append(client)
             return "SEAT BOOKED. ADDED TO WAITLIST"
 
-        if seat in lock_table:
+        if seat in lock_table:  # if already locked
             return "SEAT TEMPORARILY LOCKED"
 
-        lock_table[seat] = (client, time.time())
+        lock_table[seat] = (client, time.time())  # store lock with timestamp
 
         return "LOCK ACQUIRED"
 
 
 def handle_book(seat, client):
 
-    if seat not in seats:
+    if seat not in seats:  # validate seat
         return "INVALID SEAT"
 
-    with seat_locks[seat]:
+    with seat_locks[seat]:  # lock seat
 
-        if seat not in lock_table:
+        if seat not in lock_table:  # booking requires lock
             return "LOCK REQUIRED"
 
-        holder, ts = lock_table[seat]
+        holder, ts = lock_table[seat]  # get lock owner
 
-        if holder != client:
+        if holder != client:  # check ownership
             return "LOCK OWNED BY ANOTHER CLIENT"
 
-        log_event(f"START BOOK {seat} {client}")
+        log_event(f"START BOOK {seat} {client}")  # log start
 
-        seats[seat]["status"] = "booked"
-        seats[seat]["holder"] = client
+        seats[seat]["status"] = "booked"  # mark seat booked
+        seats[seat]["holder"] = client    # assign owner
 
-        del lock_table[seat]
+        del lock_table[seat]  # remove lock after booking
 
-        save_state()
+        save_state()  # persist data
 
-        log_event(f"COMMIT BOOK {seat} {client}")
+        log_event(f"COMMIT BOOK {seat} {client}")  # log commit
 
         return "BOOK SUCCESS"
 
 
 def handle_cancel(seat, client):
 
-    if seat not in seats:
+    if seat not in seats:  # validate seat
         return "INVALID SEAT"
 
-    with seat_locks[seat]:
+    with seat_locks[seat]:  # lock seat
 
-        if seats[seat]["holder"] != client:
+        if seats[seat]["holder"] != client:  # check ownership
             return "NOT YOUR BOOKING"
 
-        log_event(f"START CANCEL {seat}")
+        log_event(f"START CANCEL {seat}")  # log start
 
-        seats[seat]["status"] = "free"
-        seats[seat]["holder"] = None
+        seats[seat]["status"] = "free"  # free seat
+        seats[seat]["holder"] = None    # remove holder
 
-        # Waitlist handling — skip stale entries for the cancelling client
+        # remove client from waitlist if present
         if seat in waitlist:
             waitlist[seat] = [c for c in waitlist[seat] if c != client]
 
+        # assign seat to next client in waitlist
         if seat in waitlist and waitlist[seat]:
 
-            next_client = waitlist[seat].pop(0)
+            next_client = waitlist[seat].pop(0)  # FIFO
 
             seats[seat]["status"] = "booked"
             seats[seat]["holder"] = next_client
 
-        save_state()
+        save_state()  # persist changes
 
-        log_event(f"COMMIT CANCEL {seat}")
+        log_event(f"COMMIT CANCEL {seat}")  # log commit
 
         return "CANCELLED"
 
 
 def seat_map():
 
-    output = ""
+    output = ""  # string to store map
 
-    for i in range(1, 21):
+    for i in range(1, 21):  # iterate seats
 
         seat = str(i)
 
-        if seats[seat]["status"] == "free":
+        if seats[seat]["status"] == "free":  # if free
             output += "[ ] "
         else:
             output += "[X] "
 
-        if i % 5 == 0:
+        if i % 5 == 0:  # new row after 5 seats
             output += "\n"
 
     return output
@@ -165,10 +166,10 @@ def seat_map():
 
 def get_client_bookings(client):
 
-    booked = []
+    booked = []  # list of booked seats
 
     for seat in seats:
-        if seats[seat]["holder"] == client:
+        if seats[seat]["holder"] == client:  # check ownership
             booked.append(seat)
 
     if not booked:
@@ -179,17 +180,17 @@ def get_client_bookings(client):
 
 def handle_client(conn):
 
-    while True:
+    while True:  # keep receiving requests
 
         try:
 
-            data = conn.recv(1024).decode().strip()
+            data = conn.recv(1024).decode().strip()  # receive and clean input
 
-            if not data:
+            if not data:  # if client disconnects
                 break
 
-            parts = data.split()
-            cmd = parts[0]
+            parts = data.split()  # split command
+            cmd = parts[0]        # extract command
 
             if cmd == "LOCK":
                 seat, client = parts[1], parts[2]
@@ -204,10 +205,10 @@ def handle_client(conn):
                 response = handle_cancel(seat, client)
 
             elif cmd == "STATUS":
-                response = json.dumps(seats)
+                response = json.dumps(seats)  # send full seat data
 
             elif cmd == "MAP":
-                response = seat_map()
+                response = seat_map()  # send seat map
 
             elif cmd == "MYBOOKINGS":
                 client = parts[1]
@@ -216,32 +217,32 @@ def handle_client(conn):
             else:
                 response = "UNKNOWN COMMAND"
 
-            conn.send((response + "\n").encode())
+            conn.send((response + "\n").encode())  # send response
 
         except Exception:
-            break
+            break  # break on error
 
-    conn.close()
+    conn.close()  # close connection
 
 
 def start_server():
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # create TCP socket
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # allow port reuse
+    server.bind((HOST, PORT))  # bind to host and port
+    server.listen()  # start listening
 
-    print("Reservation Server Running")
+    print("Reservation Server Running")  # server status
 
-    threading.Thread(target=release_expired_locks, daemon=True).start()
+    threading.Thread(target=release_expired_locks, daemon=True).start()  # start background thread
 
     while True:
 
-        conn, addr = server.accept()
+        conn, addr = server.accept()  # accept client connection
 
-        print("Client connected:", addr)
+        print("Client connected:", addr)  # print client info
 
-        threading.Thread(target=handle_client, args=(conn,)).start()
+        threading.Thread(target=handle_client, args=(conn,)).start()  # handle client in new thread
 
 
-start_server()
+start_server()  # start server
